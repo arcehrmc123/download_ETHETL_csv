@@ -1,0 +1,285 @@
+from ethereumetl.service.eth_contract_service import EthContractService
+from ethereumetl.service.token_transfer_extractor import EthTokenTransferExtractor
+import logging
+import os
+from neo4j import GraphDatabase
+from neo4j.io import ClientError
+import pandas as pd
+import time
+import datetime
+import pytz
+
+tz = pytz.timezone('Asia/Shanghai') #东八区
+
+t = datetime.datetime.fromtimestamp(int(time.time()), pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')
+
+
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(format='%(asctime)s %(message)s')
+
+
+class EthereumETL:
+    contract_service = EthContractService()
+    token_transfer_service = EthTokenTransferExtractor()
+
+    eth_address={}
+    eth_block={}
+    eth_exterbal_tx={}
+    eth_token_tx={}
+    eth_uncle_block={}
+    unit_ex=10**18
+
+    def __init__(self):
+        #ETHETL项目解析输出csv文件存储地址
+        self.ethl_csv_path={'transaction':'/data/macong_test/transaction.csv','block':'/data/macong_test/block.csv',
+                            'token_transfer':'/data/macong_test/token_trnasfer.csv','ransaction_hashes':'/data/macong_test/ransaction_hashes.txt',
+                            'receipt':'/data/macong_test/receipts.csv','contract':'/data/macong_test/contracts.csv',
+                            'contract_addresses':'/data/macong_test/contract_addresses.txt'}
+        # 初步解析输出csv文件存储地址
+        self.parse_csv_path={'transaction':'/data/neo4j_on_docker/import/transaction.csv','block':'/data/neo4j_on_docker/import/block.csv',
+                            'token_transfer':'/data/neo4j_on_docker/import/token_trnasfer.csv','address':'/data/neo4j_on_docker/import/address.csv',
+                             'contract':'/data/neo4j_on_docker/import/contracts.csv'}
+
+        # 通过neo4j drive使用cypher语句 load csv加载路径
+        self.neo4j_internal_parse_csv_path={'transaction':"file:///transaction.csv",
+                                            'block':"file:///block.csv",
+                                            'token_transfer':'file:///token_trnasfer.csv',
+                                            'address':'file:///address.csv',
+                                            'contract':'file:///contracts.csv'}
+        self.geth_address = 'http://127.0.0.1:8545'
+
+
+
+
+
+    #ETHETL项目代码，loacl_height为当前数据库解析的block高度，interval为需要加载的block数量，ethl_csv_path为将解析输出csv文件路径
+    def down_csv_etl(self,loacl_height,interval,ethl_csv_path):
+        start_number=loacl_height+1
+        end_number=loacl_height+interval
+        logger.warning('Ethereum etl processing block from {} to {}'.format(start_number,end_number))
+
+        os.system('ethereumetl export_blocks_and_transactions --start-block {} --end-block {} \
+        --blocks-output {} --transactions-output {} \
+        --provider-uri {}'.format(start_number,end_number,ethl_csv_path['block'],ethl_csv_path['transaction'],self.geth_address))
+
+        os.system('ethereumetl export_token_transfers --start-block {} --end-block {} \
+        --output {} --provider-uri {}'.format(start_number,end_number,ethl_csv_path['token_transfer'],self.geth_address))
+
+        os.system('ethereumetl extract_csv_column --input {} --column hash --output {}'.format(ethl_csv_path['transaction'],
+                                                                                               ethl_csv_path['ransaction_hashes']))
+
+        os.system('ethereumetl export_receipts_and_logs --transaction-hashes {} \
+        --provider-uri {} --receipts-output {}'.format(ethl_csv_path['ransaction_hashes'],self.geth_address,ethl_csv_path['receipt']))
+
+        os.system('ethereumetl extract_csv_column --input {} --column contract_address '
+                  '--output {}'.format(ethl_csv_path['receipt'],ethl_csv_path['contract_addresses']))
+
+        os.system('ethereumetl export_contracts --contract-addresses {} \
+        --provider-uri {} --output {}'.format(ethl_csv_path['contract_addresses'],self.geth_address,ethl_csv_path['contract']))
+
+        logger.warning('finishing Ethereum etl task block from {} to {}'.format(start_number, end_number))
+
+
+    #ETHETL项目代码，start-end为解析的block高度区间，ethl_csv_path为将解析输出csv文件路径
+    def down_csv_etl_start_end(self,start,end,ethl_csv_path):
+        start_number=start
+        end_number=end
+        logger.warning('Ethereum etl processing block from {} to {}'.format(start_number,end_number))
+
+        os.system('ethereumetl export_blocks_and_transactions --start-block {} --end-block {} \
+        --blocks-output {} --transactions-output {} \
+        --provider-uri {}'.format(start_number,end_number,ethl_csv_path['block'],ethl_csv_path['transaction'],self.geth_address))
+
+        os.system('ethereumetl export_token_transfers --start-block {} --end-block {} \
+        --output {} --provider-uri {}'.format(start_number,end_number,ethl_csv_path['token_transfer'],self.geth_address))
+
+        os.system('ethereumetl extract_csv_column --input {} --column hash --output {}'.format(ethl_csv_path['transaction'],
+                                                                                               ethl_csv_path['ransaction_hashes']))
+
+        os.system('ethereumetl export_receipts_and_logs --transaction-hashes {} \
+        --provider-uri {} --receipts-output {}'.format(ethl_csv_path['ransaction_hashes'],self.geth_address,ethl_csv_path['receipt']))
+
+        os.system('ethereumetl extract_csv_column --input {} --column contract_address '
+                  '--output {}'.format(ethl_csv_path['receipt'],ethl_csv_path['contract_addresses']))
+
+        os.system('ethereumetl export_contracts --contract-addresses {} \
+        --provider-uri {} --output {}'.format(ethl_csv_path['contract_addresses'],self.geth_address,ethl_csv_path['contract']))
+
+        logger.warning('finishing Ethereum etl task block from {} to {}'.format(start_number, end_number))
+
+
+    #解析ETHETL项目输出csv文件，并重新保存至parse_csv_path路径
+    def read_etl_csv(self,elt_csv_path,parse_csv_path):
+        logger.warning('extract data from csv file')
+        transaction = pd.read_csv(elt_csv_path['transaction'], encoding='utf-8',
+                                  usecols=['hash', 'nonce', 'block_hash', 'block_number',
+                                           'transaction_index', 'from_address', 'to_address',
+                                           'value', 'gas', 'gas_price', 'input', 'block_timestamp',
+                                           'transaction_type'])
+        address1 = transaction[['from_address']].reset_index(drop=True)
+        address2 = transaction[['to_address']].reset_index(drop=True)
+        address1 = address1.rename(columns={'from_address': 'address'})
+        address2 = address2.rename(columns={'to_address': 'address'})
+        address1 = address1.append(address2, ignore_index=True)
+
+        transaction = transaction.rename(columns={'hash': 'transaction_hash'})
+
+        block = pd.read_csv(elt_csv_path['block'], encoding='utf-8',
+                            usecols=['number', 'hash', 'nonce', 'miner', 'difficulty', 'size',
+                                     'extra_data', 'gas_limit', 'timestamp', 'transaction_count','gas_used'])
+
+        block=block.astype("str")
+        block['number'] = block['number'].apply(lambda x: x.zfill(10))
+        block = block.drop_duplicates().reset_index(drop=True)
+
+
+
+        address5 = block[['miner']].reset_index(drop=True)
+        address5 = address5.rename(columns={'miner': 'address'})
+
+        contract = pd.read_csv(elt_csv_path['contract'], encoding='utf-8',
+                               usecols=['address', 'function_sighashes', 'is_erc20', 'is_erc721'])
+        contract = contract.drop_duplicates().reset_index(drop=True)
+
+        receipt = pd.read_csv(elt_csv_path['receipt'], encoding='utf-8',
+                              usecols=['transaction_hash', 'gas_used', 'contract_address','status'])
+        transaction = pd.merge(transaction, receipt, on=['transaction_hash'])
+        transaction.loc[pd.isnull(transaction['to_address']),'to_address']=transaction['contract_address']
+        transaction['tx_fee']=transaction['gas_used']*transaction['gas_price']
+        # df1=transaction.groupby(by=['block_number'])['tx_fee'].sum().reset_index(name=['tx_fee'])
+        transaction=transaction.astype("str")
+        transaction['block_number'] = transaction['block_number'].apply(lambda x: x.zfill(10))
+        transaction = transaction.drop_duplicates().reset_index(drop=True)
+
+
+        token_transfer = pd.read_csv(elt_csv_path['token_transfer'], encoding='utf-8',
+                                     usecols=['token_address', 'from_address', 'to_address',
+                                              'value', 'transaction_hash','block_number'])
+
+        token_transfer=token_transfer.astype("str")
+        token_transfer['block_number'] = token_transfer['block_number'].apply(lambda x: x.zfill(10))
+        token_transfer = token_transfer.drop_duplicates().reset_index(drop=True)
+
+
+        address3 = token_transfer[['from_address']].reset_index(drop=True)
+        address4 = token_transfer[['to_address']].reset_index(drop=True)
+        address3 = address3.rename(columns={'from_address': 'address'})
+        address4 = address4.rename(columns={'to_address': 'address'})
+
+        address1 = address1.append(address3, ignore_index=True)
+        address1 = address1.append(address4, ignore_index=True)
+        address1 = address1.append(address5, ignore_index=True)
+        address1=address1.drop_duplicates().reset_index(drop=True)
+
+        for i in elt_csv_path.values():
+            os.remove(i)
+
+        block.to_csv(parse_csv_path['block'], encoding='utf-8', index=False)
+        print(block)
+        transaction.to_csv(parse_csv_path['transaction'], encoding='utf-8', index=False)
+        print(transaction)
+        token_transfer.to_csv(parse_csv_path['token_transfer'], encoding='utf-8', index=False)
+        print(token_transfer)
+        address1.to_csv(parse_csv_path['address'], encoding='utf-8', index=False)
+        print(address1)
+        contract.to_csv(parse_csv_path['contract'], encoding='utf-8', index=False)
+        print(contract)
+        logger.warning('finish exaction tast')
+
+
+    def insert_address_data(self,t,parse_csv_path):
+        logger.warning('start adding address to neo4j')
+        address_query=""" 
+        UNWIND $list as addr MERGE (n:Address{address:addr})"""
+        t.run(address_query,list=parse_csv_path)
+
+
+
+    def insert_contract_data(self,t, parse_csv_path):
+        logger.warning('start adding contract address to neo4j')
+        contract_query="""
+        LOAD CSV WITH HEADERS FROM $ContractPath AS row
+        MERGE (n:Address{address:row.address})
+        SET n:CONTRACT"""
+        t.run(contract_query,ContractPath=parse_csv_path['contract'])
+
+
+    def insert_block_data(self, t,parse_csv_path):
+        logger.warning('start adding block to neo4j')
+        block_query="""
+        LOAD CSV WITH HEADERS FROM $BlockPath AS row
+        CREATE (b:Block {block_number: row.number,block_hash:row.hash,difficulty:row.difficulty,extraData:row.extra_data,
+        block_timestamp:row.timestamp,size:row.size, gas_limit:row.gas_limit, gas_uesed:row.gas_used,
+        transaction_count:row.transaction_count})"""
+        t.run(block_query, BlockPath=parse_csv_path['block'])
+
+
+    def insert_tx_data(self, t, parse_csv_path):
+        logger.warning('start adding external_tx to neo4j')
+        tx_query = """
+        CALL apoc.periodic.iterate('CALL apoc.load.csv(\"{}\") """.format(parse_csv_path['transaction'])+"""yield map as row','
+        MATCH (from:Address{address:row.from_address}),(to:Address{address:row.to_address})
+        CREATE (from)-[r:ExternalTransaction{block_number:row.block_number,transaction_hash:row.transaction_hash,
+        transaction_index:row.transaction_index,nonce:row.nonce,value:row.value,gas:row.gas,gas_price:row.gas_price,
+        gas_used: row.gas_used,type: row.transaction_type,status: row.status}]->(to)', 
+        {batchSize:1000, iterateList:true, parallel:true})
+        """
+        t.run(tx_query)
+
+    def insert_token_transfer_data(self, t,parse_csv_path):
+        logger.warning('start adding token_transfer to neo4j')
+        token_transfer_query = """
+        CALL apoc.periodic.iterate('CALL apoc.load.csv(\"{}\") """.format(parse_csv_path['token_transfer'])+"""yield map as row','
+        MATCH (from:Address{address:row.from_address}),(to:Address{address:row.to_address})
+        CREATE (from)-[r:TokenTransaction{block_number:row.block_number,transaction_hash:row.transaction_hash,token_address:row.token_address,value:row.value}]->(to)', 
+        {batchSize:1000, iterateList:true, parallel:true})"""
+        t.run(token_transfer_query)
+
+
+    def insert_miner_data(self, t, parse_csv_path):
+        logger.warning('start adding miner realtionship to neo4j')
+        token_transfer_query = """
+        CALL apoc.periodic.iterate('CALL apoc.load.csv(\"{}\") """.format(parse_csv_path['block'])+"""yield map as row','
+        MATCH (b:Block{block_number:row.number}), (miner:Address{address:row.miner})
+        CREATE (b)-[r:Reward{reward_type:"block"}]->(miner)', 
+        {batchSize:1000, iterateList:true, parallel:true})"""
+        t.run(token_transfer_query)
+
+
+    #下载相应高度的csv文件
+    def work_flow(self):
+       # 第一次手动同步启动区块高度为12571321
+       #第二次起始为13099999
+       # 第二次起始为14999999
+        local_height = 15099999
+
+        for i in range(0,1):
+            ethl_csv_path = self.ethl_csv_path
+            # parse_csv_path=self.parse_csv_path
+            # neo4j_internal_parse_csv_path=self.neo4j_internal_parse_csv_path
+            # print(neo4j_internal_parse_csv_path['address'])
+
+            parse_csv_path = {
+                'transaction': '/data/macong_test/transaction' + str(local_height + 1) + '_10w.csv',
+                'block': '/data/macong_test/block' + str(local_height + 1) + '_10w.csv',
+                'token_transfer': '/data/macong_test/token_transfer' + str(local_height + 1) + '_10w.csv',
+                'address': '/data/macong_test/address' + str(local_height + 1) + '_10w.csv',
+                'contract': '/data/macong_test/contracts' + str(local_height + 1) + '_10w.csv'}
+            self.down_csv_etl(local_height, 100000, ethl_csv_path)
+            self.read_etl_csv(ethl_csv_path, parse_csv_path)
+            local_height=local_height+100000
+
+etl = EthereumETL()
+etl.work_flow()
+
+
+
+
+
+
+
+
+
+
+
